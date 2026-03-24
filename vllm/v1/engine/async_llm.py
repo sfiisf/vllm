@@ -162,7 +162,8 @@ class AsyncLLM(EngineClient):
 
         # Loggers.
         self.logger_manager: StatLoggerManager | None = None
-        if self.log_stats:
+        # if self.log_stats:
+        if False:
             self.logger_manager = StatLoggerManager(
                 vllm_config=vllm_config,
                 engine_idxs=self.engine_core.engine_ranks_managed,
@@ -175,7 +176,7 @@ class AsyncLLM(EngineClient):
 
         self._client_count = client_count
 
-        self.output_handler: asyncio.Task | None = None
+        self.output_handler: asyncio.Task | None = None | list
         try:
             # Start output handler eagerly if we are in the asyncio eventloop.
             asyncio.get_running_loop()
@@ -282,7 +283,10 @@ class AsyncLLM(EngineClient):
     async def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         if not hasattr(self, "_supported_tasks"):
             # Cache the result
-            self._supported_tasks = await self.engine_core.get_supported_tasks_async()
+            if isinstance(self.engine_core, EngineCoreClient):
+                self._supported_tasks = await self.engine_core.get_supported_tasks_async()
+            else:
+                self._supported_tasks = await self.engine_core[0].get_supported_tasks_async()
 
         return self._supported_tasks
 
@@ -411,11 +415,22 @@ class AsyncLLM(EngineClient):
         index: int,
         queue: RequestOutputCollector,
     ):
-        # Add the request to OutputProcessor (this process).
-        self.output_processor.add_request(request, prompt, parent_req, index, queue)
+        if not (isinstance(self.output_processor, list) and isinstance(self.engine_core, list)):
+            # Add the request to OutputProcessor (this process).
+            self.output_processor.add_request(request, prompt, parent_req, index, queue)
 
-        # Add the EngineCoreRequest to EngineCore (separate process).
-        await self.engine_core.add_request_async(request)
+            # Add the EngineCoreRequest to EngineCore (separate process).
+            await self.engine_core.add_request_async(request)
+        else:
+            list_len = len(self.output_processor)
+            if parent_req is not None:
+                idx = ord(parent_req.request_id[-1]) % list_len
+            else:
+                idx = ord(request.request_id[-1]) % list_len
+
+            logger.info(f"Adding request {request.request_id} to output_processor and engine_core index {idx}.")
+            self.output_processor[idx].add_request(request, prompt, parent_req, index, queue)
+            await self.engine_core[idx].add_request_async(request)
 
         if self.log_requests:
             logger.info("Added request %s.", request.request_id)
@@ -708,7 +723,69 @@ class AsyncLLM(EngineClient):
                 logger.exception("AsyncLLM output_handler failed.")
                 output_processor.propagate_error(e)
 
-        self.output_handler = asyncio.create_task(output_handler())
+        async def output_handler_list(idx: int):
+            if idx >= len(engine_core) or idx >= len(output_processor):
+                logger.error(
+                    "Output handler index %d out of range for engine_core or output_processor list.",
+                    idx,
+                )
+                return
+            try:
+                while True:
+                    # 1) Pull EngineCoreOutputs from the EngineCore.
+                    outputs = await engine_core[idx].get_output_async()
+                    num_outputs = len(outputs.outputs)
+
+                    iteration_stats = (
+                        IterationStats() if (log_stats and num_outputs) else None
+                    )
+
+                    # Split outputs into chunks of at most
+                    # VLLM_V1_OUTPUT_PROC_CHUNK_SIZE, so that we don't block the
+                    # event loop for too long.
+                    engine_core_outputs = outputs.outputs
+                    for start in range(0, num_outputs, chunk_size):
+                        end = start + chunk_size
+                        outputs_slice = engine_core_outputs[start:end]
+                        # 2) Process EngineCoreOutputs.
+                        processed_outputs = output_processor[idx].process_outputs(
+                            outputs_slice, outputs.timestamp, iteration_stats
+                        )
+                        # NOTE: RequestOutputs are pushed to their queues.
+                        assert not processed_outputs.request_outputs
+
+                        # Allow other asyncio tasks to run between chunks
+                        if end < num_outputs:
+                            await asyncio.sleep(0)
+
+                        # 3) Abort any reqs that finished due to stop strings.
+                        if processed_outputs.reqs_to_abort:
+                            await engine_core[idx].abort_requests_async(
+                                processed_outputs.reqs_to_abort
+                            )
+
+                    output_processor[idx].update_scheduler_stats(outputs.scheduler_stats)
+
+                    # 4) Logging.
+                    # TODO(rob): make into a coroutine and launch it in
+                    # background thread once Prometheus overhead is non-trivial.
+                    if logger_ref[0]:
+                        logger_ref[0].record(
+                            engine_idx=outputs.engine_index,
+                            scheduler_stats=outputs.scheduler_stats,
+                            iteration_stats=iteration_stats,
+                            mm_cache_stats=renderer.stat_mm_cache(),
+                        )
+            except Exception as e:
+                logger.exception("AsyncLLM output_handler failed.")
+                output_processor[idx].propagate_error(e)
+
+        if not isinstance(output_processor, list):
+            self.output_handler = asyncio.create_task(output_handler())
+        else:
+            self.output_handler = [
+                asyncio.create_task(output_handler_list(idx)) for idx in range(len(output_processor))
+            ]
 
     async def abort(
         self, request_id: str | Iterable[str], internal: bool = False
@@ -718,8 +795,15 @@ class AsyncLLM(EngineClient):
         request_ids = (
             (request_id,) if isinstance(request_id, str) else as_list(request_id)
         )
-        all_request_ids = self.output_processor.abort_requests(request_ids, internal)
-        await self.engine_core.abort_requests_async(all_request_ids)
+        if not (isinstance(self.output_processor, list) and isinstance(self.engine_core, list)):
+            all_request_ids = self.output_processor.abort_requests(request_ids, internal)
+            await self.engine_core.abort_requests_async(all_request_ids)
+        else:
+            all_request_ids = []
+            for op in self.output_processor:
+                all_request_ids.extend(op.abort_requests(request_ids, internal))
+            for ec in self.engine_core:
+                await ec.abort_requests_async(all_request_ids)
 
         if self.log_requests:
             logger.info("Aborted request(s) %s.", ",".join(request_ids))
@@ -758,7 +842,11 @@ class AsyncLLM(EngineClient):
                 stacklevel=2,
             )
             mode = "wait"
-        await self.engine_core.pause_scheduler_async(mode=mode, clear_cache=clear_cache)
+        if isinstance(self.engine_core, EngineCoreClient):
+            await self.engine_core.pause_scheduler_async(mode=mode, clear_cache=clear_cache)
+        else:
+            for ec in self.engine_core:
+                await ec.pause_scheduler_async(mode=mode, clear_cache=clear_cache)
         # Small sleep to help ensure that final outputs from any in-flight requests are
         # returned prior to this method returning. These outputs come out of the engine
         # prior to the wait-for-idle completion event, but involve additional async
@@ -769,11 +857,21 @@ class AsyncLLM(EngineClient):
 
     async def resume_generation(self) -> None:
         """Resume generation after :meth:`pause_generation`."""
-        await self.engine_core.resume_scheduler_async()
+        if isinstance(self.engine_core, EngineCoreClient):
+            await self.engine_core.resume_scheduler_async()
+        else:
+            for ec in self.engine_core:
+                await ec.resume_scheduler_async()
 
     async def is_paused(self) -> bool:
         """Return whether the engine is currently paused."""
-        return await self.engine_core.is_scheduler_paused_async()
+        if isinstance(self.engine_core, EngineCoreClient):
+            return await self.engine_core.is_scheduler_paused_async()
+        else:
+            # For multiple engine cores, check if any of them is paused
+            tasks = [ec.is_scheduler_paused_async() for ec in self.engine_core]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            return any(results)
 
     async def encode(
         self,
@@ -878,45 +976,80 @@ class AsyncLLM(EngineClient):
             raise self.dead_error
 
     async def start_profile(self, profile_prefix: str | None = None) -> None:
-        coros = [self.engine_core.profile_async(True, profile_prefix)]
+        if isinstance(self.engine_core, EngineCoreClient):
+            coros = [self.engine_core.profile_async(True, profile_prefix)]
+        else:
+            coros = [ec.profile_async(True, profile_prefix) for ec in self.engine_core]
         if self.profiler is not None:
             coros.append(asyncio.to_thread(self.profiler.start))
         await asyncio.gather(*coros)
 
     async def stop_profile(self) -> None:
-        coros = [self.engine_core.profile_async(False)]
+        if isinstance(self.engine_core, EngineCoreClient):
+            coros = [self.engine_core.profile_async(False)]
+        else:
+            coros = [ec.profile_async(False) for ec in self.engine_core]
         if self.profiler is not None:
             coros.append(asyncio.to_thread(self.profiler.stop))
         await asyncio.gather(*coros)
 
     async def reset_mm_cache(self) -> None:
         self.renderer.clear_mm_cache()
-        await self.engine_core.reset_mm_cache_async()
+        if isinstance(self.engine_core, EngineCoreClient):
+            await self.engine_core.reset_mm_cache_async()
+        else:
+            for ec in self.engine_core:
+                await ec.reset_mm_cache_async()
 
     async def reset_prefix_cache(
         self, reset_running_requests: bool = False, reset_connector: bool = False
     ) -> bool:
-        return await self.engine_core.reset_prefix_cache_async(
-            reset_running_requests, reset_connector
-        )
+        if isinstance(self.engine_core, EngineCoreClient):
+            return await self.engine_core.reset_prefix_cache_async(
+                reset_running_requests, reset_connector
+            )
+        else:
+            coros = [
+                ec.reset_prefix_cache_async(reset_running_requests, reset_connector)
+                for ec in self.engine_core
+            ]
+            results = await asyncio.gather(*coros)
+            return all(results)
 
     async def reset_encoder_cache(self) -> None:
-        await self.engine_core.reset_encoder_cache_async()
+        if isinstance(self.engine_core, EngineCoreClient):
+            await self.engine_core.reset_encoder_cache_async()
+        else:
+            for ec in self.engine_core:
+                await ec.reset_encoder_cache_async()
 
     async def sleep(self, level: int = 1, mode: PauseMode = "abort") -> None:
-        await self.engine_core.sleep_async(level, mode)
+        if isinstance(self.engine_core, EngineCoreClient):
+            await self.engine_core.sleep_async(level, mode)
+        else:
+            for ec in self.engine_core:
+                await ec.sleep_async(level, mode)
 
         if self.logger_manager is not None:
             self.logger_manager.record_sleep_state(1, level)
 
     async def wake_up(self, tags: list[str] | None = None) -> None:
-        await self.engine_core.wake_up_async(tags)
+        if isinstance(self.engine_core, EngineCoreClient):
+            await self.engine_core.wake_up_async(tags)
+        else:
+            for ec in self.engine_core:
+                await ec.wake_up_async(tags)
 
         if self.logger_manager is not None:
             self.logger_manager.record_sleep_state(0, 0)
 
     async def is_sleeping(self) -> bool:
-        return await self.engine_core.is_sleeping_async()
+        if isinstance(self.engine_core, EngineCoreClient):
+            return await self.engine_core.is_sleeping_async()
+        else:
+            coros = [ec.is_sleeping_async() for ec in self.engine_core]
+            results = await asyncio.gather(*coros)
+            return any(results)
 
     async def add_lora(self, lora_request: LoRARequest) -> bool:
         """Load a new LoRA adapter into the engine for future requests."""
@@ -944,17 +1077,31 @@ class AsyncLLM(EngineClient):
         """
         Perform a collective RPC call to the given path.
         """
-        return await self.engine_core.collective_rpc_async(
-            method, timeout, args, kwargs
-        )
+        if isinstance(self.engine_core, EngineCoreClient):
+            return await self.engine_core.collective_rpc_async(
+                method, timeout, args, kwargs
+            )
+        else:
+            # Handle the case where engine_core is a list of EngineCoreClient instances
+            coros = [
+                ec.collective_rpc_async(method, timeout, args, kwargs)
+                for ec in self.engine_core
+            ]
+            results = await asyncio.gather(*coros)
+            return all(results)
 
     async def wait_for_requests_to_drain(self, drain_timeout: int = 300):
         """Wait for all requests to be drained."""
         start_time = time.time()
         while time.time() - start_time < drain_timeout:
-            if not self.engine_core.dp_engines_running():
-                logger.info("Engines are idle, requests have been drained")
-                return
+            if isinstance(self.engine_core, EngineCoreClient):
+                if not self.engine_core.dp_engines_running():
+                    logger.info("Engines are idle, requests have been drained")
+                    return
+            else:
+                if not any(ec.dp_engines_running() for ec in self.engine_core):
+                    logger.info("Engines are idle, requests have been drained")
+                    return
 
             logger.info("Engines are still running, waiting for requests to drain...")
             await asyncio.sleep(1)  # Wait 1 second before checking again
@@ -1009,7 +1156,13 @@ class AsyncLLM(EngineClient):
 
         set_scaling_elastic_ep(True)
         try:
-            await self.engine_core.scale_elastic_ep(new_data_parallel_size)
+            if isinstance(self.engine_core, EngineCoreClient):
+                await self.engine_core.scale_elastic_ep(new_data_parallel_size)
+            else:
+                coros = [
+                    ec.scale_elastic_ep(new_data_parallel_size) for ec in self.engine_core
+                ]
+                await asyncio.gather(*coros)
             self.vllm_config.parallel_config.data_parallel_size = new_data_parallel_size
         finally:
             set_scaling_elastic_ep(False)
@@ -1017,7 +1170,7 @@ class AsyncLLM(EngineClient):
     @property
     def is_running(self) -> bool:
         # Is None before the loop is started.
-        return self.output_handler is None or not self.output_handler.done()
+        return self.output_handler is None or (not isinstance(self.output_handler, list) and not self.output_handler.done()) or (isinstance(self.output_handler, list) and not any(oh.done() for oh in self.output_handler))
 
     @property
     def is_stopped(self) -> bool:
@@ -1025,7 +1178,10 @@ class AsyncLLM(EngineClient):
 
     @property
     def errored(self) -> bool:
-        return self.engine_core.resources.engine_dead or not self.is_running
+        if isinstance(self.engine_core, EngineCoreClient):
+            return self.engine_core.resources.engine_dead or not self.is_running
+        else:
+            return any(ec.resources.engine_dead for ec in self.engine_core) or not self.is_running
 
     @property
     def dead_error(self) -> BaseException:
