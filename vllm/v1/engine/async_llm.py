@@ -110,6 +110,8 @@ class AsyncLLM(EngineClient):
         # Ensure we can serialize custom transformer configs
         maybe_register_config_serialize_by_value()
 
+        self.req_idx: int = 0
+
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
         self.observability_config = vllm_config.observability_config
@@ -274,7 +276,11 @@ class AsyncLLM(EngineClient):
             renderer.shutdown()
 
         if engine_core := getattr(self, "engine_core", None):
-            engine_core.shutdown()
+            if not isinstance(engine_core, list):
+                engine_core.shutdown()
+            else:
+                for ec in engine_core:
+                    ec.shutdown()
 
         handler = getattr(self, "output_handler", None)
         if handler is not None:
@@ -415,6 +421,8 @@ class AsyncLLM(EngineClient):
         index: int,
         queue: RequestOutputCollector,
     ):
+        if not hasattr(self, "req_idx"):
+            self.req_idx = 0
         if not (isinstance(self.output_processor, list) and isinstance(self.engine_core, list)):
             # Add the request to OutputProcessor (this process).
             self.output_processor.add_request(request, prompt, parent_req, index, queue)
@@ -422,13 +430,17 @@ class AsyncLLM(EngineClient):
             # Add the EngineCoreRequest to EngineCore (separate process).
             await self.engine_core.add_request_async(request)
         else:
-            list_len = len(self.output_processor)
-            if parent_req is not None:
-                idx = ord(parent_req.request_id[-1]) % list_len
-            else:
-                idx = ord(request.request_id[-1]) % list_len
+            # list_len = len(self.output_processor)
+            # if parent_req is not None:
+            #     idx = ord(parent_req.request_id[-1]) % list_len
+            # else:
+            #     idx = ord(request.request_id[-1]) % list_len
+            idx = self.req_idx
+            self.req_idx += 1
+            if self.req_idx >= len(self.output_processor):
+                self.req_idx = 0
 
-            logger.info(f"Adding request {request.request_id} to output_processor and engine_core index {idx}.")
+            # logger.info(f"Adding request {request.request_id} to output_processor and engine_core index {idx}.")
             self.output_processor[idx].add_request(request, prompt, parent_req, index, queue)
             await self.engine_core[idx].add_request_async(request)
 
